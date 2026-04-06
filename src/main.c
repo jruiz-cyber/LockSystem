@@ -15,7 +15,7 @@ static void print_button_name(unsigned char code)
         case BUTTON_KEY3: printf("KEY3"); break;
         default:          printf("UNKNOWN"); break;
     }
-}bhbhb
+}
 
 int main(void)
 {
