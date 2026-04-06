@@ -1,20 +1,12 @@
-CC ?= gcc
-CFLAGS = -Wall -Wextra -O2 -std=c99 -Iinclude
-LDFLAGS =
+CC = gcc
+CFLAGS = -Wall -O2 -std=gnu99 -Iinclude
+SRC = src/main.c src/hw_io.c src/lock_logic.c
+OUT = digital_lock
 
-TARGET = digital_lock
-SRC = src/main.c src/lock_logic.c src/hw_io.c
-OBJ = $(SRC:.c=.o)
+all: $(OUT)
 
-all: $(TARGET)
-
-$(TARGET): $(OBJ)
-	$(CC) $(OBJ) -o $(TARGET) $(LDFLAGS)
-
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT): $(SRC)
+	$(CC) $(CFLAGS) -o $(OUT) $(SRC)
 
 clean:
-	rm -f $(OBJ) $(TARGET)
-
-.PHONY: all clean
+	rm -f $(OUT)

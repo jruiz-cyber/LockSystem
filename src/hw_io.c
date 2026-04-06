@@ -1,101 +1,130 @@
-#include "hw_io.h"
-#include "address_map_arm.h"
-
-#include <fcntl.h>
 #include <stdio.h>
-#include <sys/mman.h>
-#include <sys/select.h>
+#include <stdlib.h>
+#include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
-bool hw_init(hw_io_t *hw)
+#include "address_map_arm.h"
+#include "hw_io.h"
+
+/* File descriptor for /dev/mem so the HPS can access board registers. */
+static int fd = -1;
+/* Base virtual address returned by mmap for the lightweight bridge. */
+static void *lw_virtual = NULL;
+
+/* These pointers hold the mapped addresses for LEDs, switches, and keys. */
+static volatile uint32_t *ledr_ptr = NULL;
+static volatile uint32_t *sw_ptr   = NULL;
+static volatile uint32_t *key_ptr  = NULL;
+
+/* led_state keeps a software copy of the LED register value. */
+static uint32_t led_state = 0;
+/* Used to detect only newly pressed keys instead of held keys. */
+static uint32_t prev_keys_pressed = 0;
+
+int hw_init(void)
 {
-    if (!hw) {
-        return false;
-    }
-
-    hw->fd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (hw->fd == -1) {
+    /* Open physical memory so the program can map the DE10 board registers. */
+    fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (fd < 0) {
         perror("open(/dev/mem)");
-        return false;
+        return -1;
     }
 
-    hw->lw_virtual_base = mmap(NULL, LW_BRIDGE_SPAN, PROT_READ | PROT_WRITE,
-                               MAP_SHARED, hw->fd, LW_BRIDGE_BASE);
-    if (hw->lw_virtual_base == MAP_FAILED) {
+    /* Map the lightweight bridge that contains the standard board addresses. */
+    lw_virtual = mmap(NULL, LW_BRIDGE_SPAN, PROT_READ | PROT_WRITE, MAP_SHARED, fd, LW_BRIDGE_BASE);
+    if (lw_virtual == MAP_FAILED) {
         perror("mmap");
-        close(hw->fd);
-        hw->fd = -1;
-        return false;
+        close(fd);
+        fd = -1;
+        return -1;
     }
 
-    hw->ledr_ptr = (volatile uint32_t *)((uint8_t *)hw->lw_virtual_base + LEDR_BASE);
-    hw->sw_ptr   = (volatile uint32_t *)((uint8_t *)hw->lw_virtual_base + SW_BASE);
-    hw->key_ptr  = (volatile uint32_t *)((uint8_t *)hw->lw_virtual_base + KEY_BASE);
-    hw->previous_keys = *(hw->key_ptr);
+    /* Offset each pointer to the correct LED, switch, and key register. */
+    ledr_ptr = (volatile uint32_t *)((char *)lw_virtual + LEDR_BASE);
+    sw_ptr   = (volatile uint32_t *)((char *)lw_virtual + SW_BASE);
+    key_ptr  = (volatile uint32_t *)((char *)lw_virtual + KEY_BASE);
 
-    *(hw->ledr_ptr) = 0;
-    return true;
+    /* Start with LEDs off and no remembered key presses. */
+    *ledr_ptr = 0;
+    led_state = 0;
+    prev_keys_pressed = 0;
+    return 0;
 }
 
-void hw_close(hw_io_t *hw)
+void hw_cleanup(void)
 {
-    if (!hw) {
-        return;
+    /* Turn LEDs off before leaving the program. */
+    if (ledr_ptr)
+        *ledr_ptr = 0;
+
+    /* Unmap the lightweight bridge memory region. */
+    if (lw_virtual && lw_virtual != MAP_FAILED) {
+        munmap(lw_virtual, LW_BRIDGE_SPAN);
+        lw_virtual = NULL;
     }
 
-    if (hw->lw_virtual_base && hw->lw_virtual_base != MAP_FAILED) {
-        munmap(hw->lw_virtual_base, LW_BRIDGE_SPAN);
-        hw->lw_virtual_base = NULL;
-    }
-
-    if (hw->fd >= 0) {
-        close(hw->fd);
-        hw->fd = -1;
+    /* Close /dev/mem after the mapped access is no longer needed. */
+    if (fd >= 0) {
+        close(fd);
+        fd = -1;
     }
 }
 
-uint32_t hw_read_switches(const hw_io_t *hw)
+uint32_t hw_read_switches(void)
 {
-    return hw ? *(hw->sw_ptr) : 0;
+    /* Read only SW0 and SW1 from the switch register. */
+    return (*sw_ptr) & 0x3;
 }
 
-uint32_t hw_read_keys_raw(const hw_io_t *hw)
+uint32_t hw_read_keys_raw(void)
 {
-    return hw ? *(hw->key_ptr) : 0xF;
+    /* Read the four pushbuttons as they are in the key register. */
+    return (*key_ptr) & 0xF;
 }
 
-uint8_t hw_get_button_code(hw_io_t *hw)
+static uint32_t hw_read_keys_pressed(void)
 {
-    if (!hw) {
-        return 0;
-    }
+    /* Keys are active-low, so invert the raw bits to get pressed = 1. */
+    return (~hw_read_keys_raw()) & 0xF;
+}
 
-    uint32_t current_keys = *(hw->key_ptr);
-    uint32_t current_pressed = (~current_keys) & 0xF;
-    uint32_t previous_pressed = (~hw->previous_keys) & 0xF;
-    uint32_t new_press = current_pressed & (~previous_pressed);
+uint8_t hw_get_new_button_press(void)
+{
+    uint32_t current_pressed = hw_read_keys_pressed();
+    /* new_press keeps only buttons that were not pressed in the previous read. */
+    uint32_t new_press = current_pressed & ~prev_keys_pressed;
 
-    hw->previous_keys = current_keys;
+    /* Save the current key state for edge detection on the next call. */
+    prev_keys_pressed = current_pressed;
 
+    /* Return the corresponding button code for the newly detected button press. */
     if (new_press & 0x1) return 0x1;
     if (new_press & 0x2) return 0x2;
     if (new_press & 0x4) return 0x4;
     if (new_press & 0x8) return 0x8;
-
     return 0;
 }
 
-void hw_set_leds(const hw_io_t *hw, uint32_t value)
+void hw_write_leds(uint32_t value)
 {
-    if (hw) {
-        *(hw->ledr_ptr) = value;
-    }
+    /* Limit the value to the ten board LEDs, then write it to the LED register. */
+    led_state = value & 0x3FF;
+    *ledr_ptr = led_state;
 }
 
-void hw_sleep_ms(unsigned int ms)
+void hw_set_led0(int on)
 {
-    struct timeval tv;
-    tv.tv_sec = ms / 1000U;
-    tv.tv_usec = (int)((ms % 1000U) * 1000U);
-    select(0, NULL, NULL, NULL, &tv);
+    /* Set or clear LED0 while leaving the other LED bits unchanged. */
+    if (on) led_state |= 0x1;
+    else    led_state &= ~0x1;
+    *ledr_ptr = led_state;
+}
+
+void hw_set_led1(int on)
+{
+    /* Set or clear LED1 while leaving the other LED bits unchanged. */
+    if (on) led_state |= 0x2;
+    else    led_state &= ~0x2;
+    *ledr_ptr = led_state;
 }
